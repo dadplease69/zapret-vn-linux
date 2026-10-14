@@ -1,0 +1,10 @@
+# Скрипты запускаются в Linux — всегда LF, даже если коммит делается из Windows
+* text=auto
+*.sh text eol=lf
+*.service text eol=lf
+*.md text eol=lf
+lists/*.txt text eol=lf
+SHA256SUMS text eol=lf
+
+bin/* binary
+*.bin binary

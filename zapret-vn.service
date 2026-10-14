@@ -1,0 +1,15 @@
+[Unit]
+Description=Zapret VN — обход DPI-блокировок (nfqws)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@ROOT@/zapret-vn.sh run
+Restart=on-failure
+RestartSec=5
+# на случай, если процесс убит принудительно — убрать правила файрвола
+ExecStopPost=@ROOT@/zapret-vn.sh stop-rules
+
+[Install]
+WantedBy=multi-user.target

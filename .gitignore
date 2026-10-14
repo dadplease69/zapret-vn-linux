@@ -1,0 +1,5 @@
+# локальное состояние
+config/settings.conf
+zapret-vn.log
+lists/autohostlist.txt.bak
+*.tmp
