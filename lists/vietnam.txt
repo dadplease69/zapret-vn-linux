@@ -11,6 +11,10 @@ steamusercontent.com
 steamserver.net
 s.team
 valvesoftware.com
+# загрузки и обновления игр (CDN; блокируются с октября 2026)
+steamcontent.com
+steampipe.akamaized.net
+steamcdn-a.akamaihd.net
 
 # --- Roblox ---
 roblox.com

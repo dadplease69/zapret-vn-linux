@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Zapret VN для Linux 1.0.0
+# Zapret VN для Linux 1.0.1
 #
 # Обход DPI-блокировок (Steam, Roblox, Telegram и др.) без VPN.
 # Обёртка вокруг официального nfqws из zapret v72.13 (https://github.com/bol-van/zapret, MIT).
@@ -13,7 +13,7 @@ set -u
 # printf должен считать символы, а не байты (иначе таблица в `check` съезжает)
 case "${LC_ALL:-${LANG:-}}" in *UTF-8*|*utf8*|*UTF8*) ;; *) export LC_ALL=C.UTF-8 ;; esac
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 ZAPRET_VERSION="v72.13"
 
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -35,6 +35,14 @@ TABLE="zapret_vn"                # имя таблицы nftables
 RUN_USER="${ZVN_USER:-nobody}"   # от чьего имени работает nfqws после старта
 UNIT="/etc/systemd/system/zapret-vn.service"
 DEFAULT_STRATEGY="multidisorder"
+CMD_LINK="/usr/local/bin/zapret-vn"
+DNS_CONF="/etc/systemd/resolved.conf.d/zapret-vn.conf"
+
+# TCP-порты, трафик на которые проходит через nfqws: веб + серверы входа Steam (WebSocket на 27015-27050).
+# Обход по-прежнему применяется только к доменам из списков — остальной трафик на этих портах nfqws пропускает как есть.
+TCP_PORTS_NFQWS="80,443,27015-27050"
+TCP_PORTS_NFT="80, 443, 27015-27050"
+TCP_PORTS_IPT="80,443,27015:27050"
 
 # ----------------------------------------------------------------------------- стратегии
 # Порядок = приоритет при автоподборе (как в Windows-версии). {FAKE} заменяется на папку fake/.
@@ -73,6 +81,8 @@ SITES=(
   "Steam — оплата|checkout.steampowered.com"
   "Steam — картинки|store.fastly.steamstatic.com"
   "Steam — чат|steam-chat.com"
+  "Steam — вход (серверы CM)|cmp1-sgp1.steamserver.net"
+  "Steam — загрузки игр|cache1-sgp1.steamcontent.com"
   "Roblox — API|apis.roblox.com"
   "Roblox — вход в игру|gamejoin.roblox.com"
   "Roblox — друзья и чат|realtime-signalr.roblox.com"
@@ -84,6 +94,8 @@ PICK_HOSTS=(
   store.steampowered.com steamcommunity.com help.steampowered.com checkout.steampowered.com
   store.fastly.steamstatic.com steam-chat.com apis.roblox.com gamejoin.roblox.com web.telegram.org
 )
+# в `check`: отдаёт ли DNS этой машины настоящие адреса (без них Steam не войдёт и не скачает, обход тут не поможет)
+DNS_CHECK_HOSTS=(cmp1-sgp1.steamserver.net cache1-sgp1.steamcontent.com store.steampowered.com)
 
 # ----------------------------------------------------------------------------- утилиты
 say()  { printf '%s\n' "$*"; }
@@ -118,16 +130,27 @@ nfqws_bin() {
 }
 
 # ----------------------------------------------------------------------------- настройки
+# settings.conf — строки КЛЮЧ=значение (STRATEGY, DNS)
+conf_get() {
+  [ -r "$CONF" ] && sed -n "s/^$1=//p" "$CONF" | tail -n1
+  return 0
+}
+
+conf_set() {
+  local key=$1 val=$2 tmp="$CONF.tmp"
+  mkdir -p "$CONF_DIR" || return 1
+  { [ -r "$CONF" ] && grep -v "^$key=" "$CONF"; printf '%s=%s\n' "$key" "$val"; } > "$tmp" && mv -f "$tmp" "$CONF"
+}
+
 get_strategy() {
-  local s=""
-  [ -r "$CONF" ] && s="$(sed -n 's/^STRATEGY=//p' "$CONF" | tail -n1)"
+  local s; s="$(conf_get STRATEGY)"
   s="${s:-$DEFAULT_STRATEGY}"
   [ -n "${STRAT_ARGS[$s]+x}" ] || s="$DEFAULT_STRATEGY"
   printf '%s\n' "$s"
 }
 
 set_strategy() {
-  mkdir -p "$CONF_DIR" && printf 'STRATEGY=%s\n' "$1" > "$CONF" || die "не удалось записать $CONF"
+  conf_set STRATEGY "$1" || die "не удалось записать $CONF"
 }
 
 # Заполняет глобальный массив NFQWS_ARGS
@@ -140,7 +163,7 @@ build_args() {
   if [ "$RUN_USER" = root ]; then NFQWS_ARGS+=("--uid=0:0")
   elif id -u "$RUN_USER" >/dev/null 2>&1; then NFQWS_ARGS+=("--user=$RUN_USER"); fi
   NFQWS_ARGS+=(
-    --filter-tcp=80,443
+    --filter-tcp=$TCP_PORTS_NFQWS
     "--hostlist=$LISTS/vietnam.txt" "--hostlist-exclude=$LISTS/exclude.txt"
     "--hostlist-auto=$LISTS/autohostlist.txt" --hostlist-auto-fail-threshold=3
     "${tcp_arr[@]}"
@@ -163,6 +186,38 @@ prepare_files() {
   chmod 644 "$FAKE"/*.bin 2>/dev/null
 }
 
+# ----------------------------------------------------------------------------- защищённый DNS и самовосстановление
+resolved_installed() { command -v systemctl >/dev/null 2>&1 && command -v resolvectl >/dev/null 2>&1; }
+resolved_active()    { command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved 2>/dev/null; }
+
+write_dns_conf() {
+  mkdir -p "$(dirname "$DNS_CONF")" || return 1
+  cat > "$DNS_CONF" <<'EOF'
+# Создано Zapret VN: защищённый DNS (DNS-over-TLS) вместо DNS провайдера. Убрать: zapret-vn dns-off
+[Resolve]
+DNS=8.8.8.8#dns.google 8.8.4.4#dns.google 1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com
+Domains=~.
+DNSOverTLS=yes
+EOF
+}
+
+# Обновления некоторых систем (например, SteamOS на Steam Deck) перезаписывают системные папки:
+# пропадает команда zapret-vn и настройка защищённого DNS. Служба при каждом старте возвращает их на место.
+heal_system() {
+  if [ ! -e "$CMD_LINK" ]; then
+    mkdir -p "$(dirname "$CMD_LINK")" 2>/dev/null
+    ln -sf "$SELF" "$CMD_LINK" 2>/dev/null && say "Восстановлена команда $CMD_LINK"
+  fi
+  if [ "$(conf_get DNS)" = on ] && [ ! -e "$DNS_CONF" ] && resolved_installed; then
+    if write_dns_conf; then
+      # --no-block: не ждём перезапуска резолвера, чтобы не задерживать старт обхода
+      systemctl try-restart --no-block systemd-resolved 2>/dev/null
+      say "Восстановлен защищённый DNS (настройка пропала — например, после обновления системы)"
+    fi
+  fi
+  return 0
+}
+
 # ----------------------------------------------------------------------------- файрвол
 fw_backend() {
   case "${ZVN_FW:-auto}" in
@@ -183,12 +238,12 @@ nft_rules() {
 table inet $TABLE {
 	chain post {
 		type filter hook postrouting priority 99; policy accept;
-		meta mark & $MARK == 0 tcp dport { 80, 443 } ct original packets 1-9 queue num $QNUM bypass
+		meta mark & $MARK == 0 tcp dport { $TCP_PORTS_NFT } ct original packets 1-9 queue num $QNUM bypass
 		meta mark & $MARK == 0 udp dport 443 ct original packets 1-9 queue num $QNUM bypass
 	}
 	chain pre {
 		type filter hook prerouting priority -99; policy accept;
-		tcp sport { 80, 443 } ct reply packets 1-3 queue num $QNUM bypass
+		tcp sport { $TCP_PORTS_NFT } ct reply packets 1-3 queue num $QNUM bypass
 	}
 	chain predefrag {
 		type filter hook output priority -401; policy accept;
@@ -209,9 +264,9 @@ ipt_specs() {
   local r="-m connbytes --connbytes-dir=reply --connbytes-mode=packets --connbytes 1:3"
   local q="-j NFQUEUE --queue-num $QNUM --queue-bypass"
   printf '%s\n' \
-    "POSTROUTING|-p tcp -m multiport --dports 80,443 $o -m mark ! --mark $MARK/$MARK $q" \
+    "POSTROUTING|-p tcp -m multiport --dports $TCP_PORTS_IPT $o -m mark ! --mark $MARK/$MARK $q" \
     "POSTROUTING|-p udp --dport 443 $o -m mark ! --mark $MARK/$MARK $q" \
-    "PREROUTING|-p tcp -m multiport --sports 80,443 $r $q"
+    "PREROUTING|-p tcp -m multiport --sports $TCP_PORTS_IPT $r $q"
 }
 
 # $1 = -I | -D, $2 = iptables | ip6tables
@@ -294,6 +349,7 @@ cmd_run() {
        Решение: sudo $SELF install   (поставит программу в /opt/zapret-vn)
        или запустите с ZVN_USER=root (работает, но менее безопасно)."
   fi
+  heal_system
   trap cleanup EXIT
   trap 'exit 143' INT TERM
   fw_add || exit 1
@@ -365,7 +421,13 @@ cmd_status() {
   else
     say "Служба systemd: не установлена (./zapret-vn.sh install-service)"
   fi
+  local dns
+  if [ -e "$DNS_CONF" ]; then dns="включён (DNS-over-TLS, 8.8.8.8 / 1.1.1.1)"
+  elif [ "$(conf_get DNS)" = on ]; then dns="настройка пропала — вернётся при перезапуске службы (или: sudo zapret-vn dns-on)"
+  else dns="выключен, DNS от провайдера (включить: sudo zapret-vn dns-on)"; fi
+  say "Защищённый DNS: $dns"
   say "Автосписок: $(read_domains "$LISTS/autohostlist.txt" | wc -l) доменов"
+  [ -e "$CMD_LINK" ] || say "Команда zapret-vn: нет ссылки $CMD_LINK — вернётся при перезапуске службы; пока используйте $SELF"
   [ -s "$LOG" ] && { say "--- последние строки журнала ($LOG)"; tail -n 5 "$LOG"; }
   return 0
 }
@@ -421,6 +483,7 @@ probe() {
 describe() {
   case "$1" in
     0)  echo "открывается" ;;
+    52) echo "открывается (сервер ответил)" ;;
     6)  echo "адрес не найден (DNS)" ;;
     7)  echo "нет соединения" ;;
     28) echo "не отвечает (таймаут)" ;;
@@ -446,10 +509,28 @@ cmd_check() {
   for e in "${entries[@]}"; do
     d="${e#*|}"
     code="$(head -n1 "$tmp/$d" 2>/dev/null || echo 1)"
-    if [ "$code" = 0 ]; then ok=$((ok + 1)); mark="✔"; else mark="✖"; fi
+    # 52 = TLS прошёл, сервер закрыл соединение без HTTP-ответа (так ведут себя серверы входа Steam) — значит, доступен
+    case "$code" in 0|52) ok=$((ok + 1)); mark="✔" ;; *) mark="✖" ;; esac
     printf '%s  %-28s %-34s %s\n' "$mark" "${e%%|*}" "$d" "$(describe "$code")"
   done
   say "Открывается $ok из ${#entries[@]}"
+  check_dns
+}
+
+# Проверка выше идёт мимо DNS (с настоящими адресами), поэтому отдельно смотрим, что отдаёт DNS самой машины
+check_dns() {
+  local d sys bad=()
+  for d in "${DNS_CHECK_HOSTS[@]}"; do
+    [ -n "${IPS[$d]:-}" ] || continue   # настоящий адрес узнать не удалось — сравнивать не с чем
+    sys="$(getent ahostsv4 "$d" 2>/dev/null | awk 'NR==1 {print $1}')"
+    case "$sys" in ""|127.*|0.0.0.0) bad+=("$d") ;; esac
+  done
+  [ ${#bad[@]} -eq 0 ] && return 0
+  say ""
+  say "⚠ DNS этой машины не отдаёт настоящие адреса: ${bad[*]}"
+  say "  Steam не сможет войти или скачивать игры, даже если строки выше с ✔ (они проверялись мимо DNS)."
+  say "  Решение: sudo zapret-vn dns-on"
+  return 0
 }
 
 cmd_pick() {
@@ -546,36 +627,49 @@ cmd_dns_on() {
   ensure_root
   command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved 2>/dev/null \
     || die "systemd-resolved не активен. Включите DNS-over-TLS вручную на 8.8.8.8 / 1.1.1.1 (порт 853) в вашем резолвере."
-  local conf=/etc/systemd/resolved.conf.d/zapret-vn.conf base=0
+  local base=0
   getent hosts example.com >/dev/null 2>&1 && base=1   # работал ли DNS до наших изменений
-  mkdir -p /etc/systemd/resolved.conf.d
-  cat > "$conf" <<'EOF'
-# Создано Zapret VN: защищённый DNS (DNS-over-TLS) вместо DNS провайдера
-[Resolve]
-DNS=8.8.8.8#dns.google 8.8.4.4#dns.google 1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com
-Domains=~.
-DNSOverTLS=yes
-EOF
+  write_dns_conf || die "не удалось записать $DNS_CONF"
   systemctl restart systemd-resolved
   if ! dns_works; then
     if [ "$base" = 1 ]; then
       # строгий DoT без запасного канала: если порт 853 закрыт, машина осталась бы без DNS — откатываем
-      rm -f "$conf"
+      rm -f "$DNS_CONF"
       systemctl restart systemd-resolved
+      conf_set DNS off
       die "после включения DNS-over-TLS имена перестали разрешаться (порт 853 закрыт сетью или провайдером?) — изменения отменены, DNS как был."
     fi
     warn "не удалось проверить работу DNS (нет сети?) — защищённый DNS оставлен включённым; отключить: zapret-vn dns-off"
   fi
+  conf_set DNS on   # служба будет возвращать настройку, если её сотрёт обновление системы
+  # resolv.conf должен вести в systemd-resolved: ссылкой на stub-resolv.conf или строкой nameserver 127.0.0.53 (так в SteamOS)
   [ "$(readlink -f /etc/resolv.conf 2>/dev/null)" = "/run/systemd/resolve/stub-resolv.conf" ] \
+    || grep -qE '^nameserver[[:space:]]+127\.0\.0\.53' /etc/resolv.conf 2>/dev/null \
     || warn "/etc/resolv.conf не указывает на stub-resolv.conf systemd-resolved — приложения могут по-прежнему использовать другой DNS"
   say "Защищённый DNS включён (DNS-over-TLS, 8.8.8.8 / 1.1.1.1). Проверка: resolvectl status"
 }
 
 cmd_dns_off() {
   ensure_root
-  rm -f /etc/systemd/resolved.conf.d/zapret-vn.conf
+  rm -f "$DNS_CONF"
+  conf_set DNS off
   command -v systemctl >/dev/null 2>&1 && systemctl restart systemd-resolved 2>/dev/null
   say "Защищённый DNS выключен, DNS снова от провайдера/сети."
+}
+
+# merge_list <из> <в> — дописать в список домены, которых там ещё нет (правки пользователя не трогаем)
+merge_list() {
+  local src=$1 dst=$2 d n=0
+  [ -r "$src" ] || return 0
+  [ -e "$dst" ] || { cp -a "$src" "$dst"; return 0; }
+  [ -s "$dst" ] && [ -n "$(tail -c1 "$dst")" ] && printf '\n' >> "$dst"   # последняя строка без перевода строки
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    read_domains "$dst" | grep -qxF -- "$d" && continue
+    printf '%s\n' "$d" >> "$dst"; n=$((n + 1))
+  done < <(read_domains "$src")
+  [ "$n" -gt 0 ] && say "В $(basename "$dst") добавлено новых доменов: $n"
+  return 0
 }
 
 # Копирует программу в /opt/zapret-vn (там доступно пользователю nobody), делает ссылку /usr/local/bin/zapret-vn и ставит службу
@@ -590,17 +684,36 @@ cmd_install() {
     esac
   done
   if [ "$ROOT" != "$dst" ]; then
+    # обновление поверх работающей версии: сначала останавливаем службу (её скрипт и nfqws сейчас заняты)
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet zapret-vn 2>/dev/null; then
+      say "Останавливаю работающую службу для обновления..."
+      systemctl stop zapret-vn
+    fi
     mkdir -p "$dst/lists" "$dst/config" || die "не удалось создать $dst"
     for f in zapret-vn.sh zapret-vn.service SHA256SUMS README.md CHANGELOG.md LICENSE LICENSE.zapret LICENSE.zapret-vn THIRD_PARTY_NOTICES.md bin fake; do
-      [ -e "$ROOT/$f" ] && cp -a "$ROOT/$f" "$dst/"
+      [ -e "$ROOT/$f" ] || continue
+      if [ -d "$ROOT/$f" ]; then cp -a "$ROOT/$f" "$dst/" || die "не удалось скопировать $f"
+      else cp -a "$ROOT/$f" "$dst/$f.new" && mv -f "$dst/$f.new" "$dst/$f" || die "не удалось скопировать $f"; fi
     done
-    # списки и настройки — только если их ещё нет (не затираем правки пользователя)
+    # списки: чужие правки не затираем, новые домены из этой версии дописываем; настройки — только если их нет
     cp -an "$ROOT/lists/." "$dst/lists/" 2>/dev/null
+    merge_list "$ROOT/lists/vietnam.txt" "$dst/lists/vietnam.txt"
+    merge_list "$ROOT/lists/exclude.txt" "$dst/lists/exclude.txt"
     [ -d "$ROOT/config" ] && cp -an "$ROOT/config/." "$dst/config/" 2>/dev/null
     chmod 755 "$dst" "$dst/zapret-vn.sh" "$dst"/bin/* 2>/dev/null
-    say "Установлено в $dst (списки и настройки, если уже были, сохранены)."
+    say "Установлено в $dst (ваши списки и настройки сохранены)."
   fi
-  ln -sf "$dst/zapret-vn.sh" /usr/local/bin/zapret-vn 2>/dev/null && say "Команда: zapret-vn <команда>"
+  mkdir -p "$(dirname "$CMD_LINK")" 2>/dev/null
+  if ln -sf "$dst/zapret-vn.sh" "$CMD_LINK" 2>/dev/null; then
+    say "Команда: zapret-vn <команда>"
+  else
+    warn "не удалось создать $CMD_LINK (системная папка только для чтения?). Команда для своей оболочки:"
+    warn "  echo \"alias zapret-vn='sudo $dst/zapret-vn.sh'\" >> ~/.bashrc"
+  fi
+  # защищённый DNS: если пользователь его выключал (dns-off), при обновлении не включаем обратно
+  if [ "$want_dns" = 1 ] && [ "$(sed -n 's/^DNS=//p' "$dst/config/settings.conf" 2>/dev/null | tail -n1)" = off ]; then
+    want_dns=0; say "Защищённый DNS был выключен вами — оставляю выключенным (включить: sudo zapret-vn dns-on)."
+  fi
   "$dst/zapret-vn.sh" verify || die "проверка хешей не пройдена — установка остановлена"
   "$dst/zapret-vn.sh" install-service || die "не удалось установить службу"
   if [ "$want_dns" = 1 ]; then
@@ -623,7 +736,9 @@ cmd_install_service() {
   prepare_files
   sed "s#@ROOT@#$ROOT#g" "$ROOT/zapret-vn.service" > "$UNIT"
   systemctl daemon-reload || die "systemctl daemon-reload не выполнился (systemd не запущен?)"
-  systemctl enable --now zapret-vn || die "не удалось включить службу (journalctl -u zapret-vn)"
+  systemctl enable zapret-vn || die "не удалось включить автозапуск службы"
+  # restart, а не start: если служба уже работала, она должна подхватить новую версию
+  systemctl restart zapret-vn || die "не удалось запустить службу (journalctl -u zapret-vn)"
   say "Служба установлена и запущена; стартует вместе с системой. Журнал: journalctl -u zapret-vn"
 }
 
@@ -645,13 +760,14 @@ Zapret VN для Linux $VERSION (nfqws из zapret $ZAPRET_VERSION)
 Использование: ./zapret-vn.sh <команда>
 
   start | stop | restart | status   управление обходом (нужен root; sudo подставится сам)
-  check                             открываются ли Steam / Roblox / Telegram прямо сейчас
+  check                             открываются ли Steam (магазин, вход, загрузки) / Roblox / Telegram + проверка DNS
   pick                              автоподбор стратегии (пробует все 10 и выбирает лучшую)
   strategy [id]                     показать список / выбрать стратегию
   dns-on | dns-off                  защищённый DNS (DNS-over-TLS через systemd-resolved)
   install-service                   только служба systemd из текущей папки (автозапуск с системой)
   install [--no-dns] [--pick]       всё в одном: /opt/zapret-vn + служба systemd (автозапуск) + защищённый DNS + проверка
                                     --no-dns — не трогать DNS;  --pick — сразу подобрать стратегию автоматически
+                                    повторный install из новой версии = обновление (списки и настройки сохраняются)
   uninstall-service                 удалить службу и правила файрвола
   verify                            проверить хеши nfqws и fake-файлов
   rules                             показать правила файрвола, которые будут применены
